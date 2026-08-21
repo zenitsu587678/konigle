@@ -1,157 +1,650 @@
-# my_agent
+https://v26r5tzydt.konigle.net/
 
-An [ADK](https://google.github.io/adk-docs/) agent that lets you talk to your
-spa's real booking data in plain English — "what's open Thursday", "book
-Jane in for a facial", "who's on the waitlist" — instead of clicking through
-Django admin.
 
-It's a single file, `agent.py`, with no database of its own: every tool call
-reads or writes the exact same `db.sqlite3` your Django site uses, through
-the same models (`bookings/models.py`).
+Luxury Spa — Django Booking Backend
 
-## Quick start
+A Django-based backend for the Luxury Spa website. It provides the booking API, availability checking, waitlist handling, Django Admin dashboard, Contact Us message processing, Cloudflare Turnstile verification, and an optional Gemini/Google ADK booking agent.
 
-```bash
-cd spa_backend          # same folder as manage.py
-pip install google-adk
-cp my_agent/.env.example my_agent/.env   # then paste in your Gemini API key
+Features
 
-python manage.py migrate      # if you haven't already
-adk run my_agent               # terminal chat
-# or
-adk web --port 8001            # browser UI — 8001 because Django's
-                                # runserver already owns port 8000
-```
+Appointment booking API
 
-Try: *"What services do you have?"*, *"What's open on 2026-08-20?"*,
-*"Book Jane Doe, jane@example.com, 555-1234 for a Swedish massage on
-2026-08-20 at 10am."*
+Customer name, email, phone, service, date, time, therapist preference and notes
 
-## How a request flows through the code
+Automatic booking reference IDs such as SPA-2026-1234
 
-```
-You type a message
-  → ADK sends it to the Gemini API over HTTPS, along with a schema
-    describing every tool (built from each function's name/args/docstring)
-  → Gemini decides which tool to call and with what arguments, and
-    sends that decision back
-  → ADK finds the matching Python function in this file and calls it
-  → the tool's async wrapper hands off to a worker thread (see "Why
-    async?" below)
-  → that thread runs a normal Django ORM query against db.sqlite3
-  → the result (a plain dict) travels back up: thread → wrapper → ADK
-  → ADK sends that dict to Gemini in a second API call
-  → Gemini turns it into a natural-language reply, which is what you see
-```
+Input validation and privacy-policy consent checking
 
-Nothing about your database schema or code is ever sent to Gemini — only
-the tool docstrings (what each tool does) and whatever a tool call returns
-(the actual data).
+Optional API-key protection
 
-## File-by-file walkthrough of `agent.py`
+Availability management
 
-**Django bootstrap (top of the file)**
-```python
-os.environ.setdefault("DJANGO_SETTINGS_MODULE", "spabackend.settings")
-django.setup()
-```
-Outside of `manage.py`, Django doesn't know it's supposed to be running.
-This does by hand what `manage.py` normally does for you — load
-`INSTALLED_APPS`, wire up the ORM — so `from bookings.models import Booking`
-a few lines later actually works.
+Configurable recurring daily time slots
 
-**Retry config**
-```python
-_RETRY_CONFIG = types.GenerateContentConfig(
-    http_options=types.HttpOptions(retry_options=types.HttpRetryOptions(...)),
-)
-```
-Configures the Gemini HTTP client to automatically retry with exponential
-backoff on 503/429/500/502/504 — so a "model overloaded" blip retries
-itself instead of failing your request.
+Active/inactive spa services
 
-**Why every tool is `async def` + `sync_to_async`**
+Date-specific availability checks
 
-`adk web` runs inside an asyncio event loop. Django refuses to run
-synchronous ORM queries directly on that loop (`SynchronousOnlyOperation`)
-to protect against corrupting shared connections. So every tool here is
-split in two:
+Confirmed bookings automatically remove a slot from availability for that date
 
-```python
-def _get_service_info_sync(service_name: str = "") -> dict:
-    ...  # the real Service.objects.filter(...) query
+Automatic waitlist
 
-async def get_service_info(service_name: str = "") -> dict:
-    """docstring — this is what Gemini reads to know what the tool does"""
-    return await sync_to_async(_get_service_info_sync, thread_sensitive=True)(service_name)
-```
+If a requested date/time already has a confirmed booking, the new request is stored as WAITLISTED
 
-The private `_..._sync` function is where the actual ORM logic lives. The
-public `async def` version is the one-liner ADK actually sees — it hands
-the real work to a dedicated worker thread via `sync_to_async`, which is
-safe for the ORM. `thread_sensitive=True` reuses one consistent thread
-across calls rather than spawning a new one each time, which SQLite prefers.
+When a confirmed booking is cancelled, the earliest waitlisted booking for that same slot can be promoted automatically
 
-If you add a new tool, follow the same shape.
+Django Admin dashboard
 
-**The tools**
+View, search and filter bookings
 
-`add_timeslot` is defined in this file but deliberately left out of
-`root_agent`'s `tools` list — opening a new recurring daily time is a
-bigger schedule change than closing one, so it's kept out of what this
-agent (reachable by customers) can do on its own. Wire it back in only once
-this agent is split so staff-only tools sit behind their own access check
-(see "Known limitations" below).
+Update booking status
 
-| Tool | What it touches | Notes |
-|---|---|---|
-| `get_service_info` | `Service` | list/search active services & pricing |
-| `check_availability` | `TimeSlot`, `Booking` | open times not already `CONFIRMED` on a date |
-| `book_slot` | `Booking` | confirms, or waitlists if the slot's taken |
-| `cancel_booking` | `Booking` | cancels by `booking_id`; auto-promotes the oldest waitlisted booking for that date/time |
-| `reschedule_booking` | `Booking` | `await`s `cancel_booking` then `book_slot` internally |
-| `block_timeslot` *(staff)* | `TimeSlot` | closes a recurring time; existing bookings unaffected |
-| `list_bookings` *(staff)* | `Booking` | filter by date/status |
-| `get_waitlist` *(staff)* | `Booking` | who's waiting, oldest first |
+Manage services and time slots
 
-`TimeSlot` in your model is a recurring daily template (just a `time`, no
-date/staff) — so "closing 2pm" closes 2pm every day, not just one date.
+View Contact Us messages
 
-**`root_agent`**
-```python
-root_agent = Agent(
-    model="gemini-3.6-flash",
-    generate_content_config=_RETRY_CONFIG,
-    tools=[get_service_info, check_availability, ...],
-    instruction="...",
-)
-```
-This is the only name ADK looks for when it imports this file. `tools` is
-a list of the actual Python function objects — ADK introspects each one at
-startup to build what Gemini sees. `instruction` is the system prompt: the
-*rules* for behavior (waitlist wording, always re-check current data,
-don't invent details). The tool docstrings are the rules for *what each
-tool does* — together that's the entirety of what Gemini knows.
+See the agent's classification and reply
 
-## Known limitations / things to watch for
+Export selected bookings to CSV
 
-- **One combined agent, not two.** Both customer tools (`book_slot`, etc.)
-  and staff tools (`block_timeslot`, `list_bookings`, `get_waitlist`) are
-  in the same `root_agent`, so anyone talking to it can call either.
-  `add_timeslot` is defined but intentionally not registered, since opening
-  new schedule capacity is a bigger change than closing it — before giving
-  customers access, split staff-only tools (including re-adding
-  `add_timeslot`) into a second `Agent` gated behind auth.
-- **Stale answers within one chat.** Once a tool result is in the
-  conversation history, the model can answer from that instead of
-  re-calling the tool — so if you edit a booking in Django admin mid-chat,
-  ask the agent to "check again" rather than assuming it already knows.
-- **Email is a console-log stub.** `_send_email()` just prints; wire up
-  real `EMAIL_HOST`/etc. in `spabackend/settings.py` and swap the body of
-  that function for `django.core.mail.send_mail` when you're ready.
-- **Port collision with Django.** `python manage.py runserver` and
-  `adk web` both default to port 8000 — run `adk web --port 8001` (or move
-  Django to a different port) to run both at once.
-- **`gemini-3.6-flash` will eventually get a deprecation date too.** Check
-  Google's model deprecation page occasionally and update the `model=`
-  string in `root_agent` when it does.
+Contact Us workflow
+
+Saves customer name, email and message in ContactMessage
+
+Classifies messages such as rescheduling requests
+
+Matches a reschedule request using both customer name and email
+
+Checks the real booking calendar
+
+Reschedules when the requested slot is available
+
+Moves the booking to the waitlist when the requested slot is full
+
+Stores the agent's response and affected booking in the database
+
+Cloudflare Turnstile
+
+Optional bot protection for public booking submissions
+
+Secret key is read from environment variables rather than source code
+
+Gemini / Google ADK agent
+
+Checks services and prices
+
+Checks availability
+
+Books appointments
+
+Cancels appointments
+
+Reschedules appointments
+
+Views bookings and waitlist
+
+Processes Contact Us messages
+
+Uses the same Django database as the website
+
+Project Structure
+
+spa_backend/
+├── manage.py
+├── requirements.txt
+├── .env
+├── bookings/
+│   ├── admin.py
+│   ├── apps.py
+│   ├── models.py
+│   ├── services.py
+│   ├── views.py
+│   ├── urls.py
+│   ├── middleware.py
+│   └── ...
+├── my_agent/
+│   ├── __init__.py
+│   └── agent.py
+├── spabackend/
+│   ├── settings.py
+│   ├── urls.py
+│   ├── asgi.py
+│   └── wsgi.py
+├── templates/
+├── static/
+└── staticfiles/
+
+Requirements
+
+Python 3.10+
+
+Django 5.2+
+
+A virtual environment is recommended
+
+Google Gemini / Google ADK only if the agent functionality is required
+
+PostgreSQL can be used through DATABASE_URL; SQLite is used by default
+
+Install the dependencies with:
+
+pip install -r requirements.txt
+
+Configuration
+
+Create a .env file in the project root.
+
+Example:
+
+DJANGO_SECRET_KEY=replace-with-a-new-secret-key
+DJANGO_DEBUG=true
+DJANGO_TIME_ZONE=Asia/Singapore
+
+FRONTEND_URL=https://your-website.example/
+
+REQUIRE_CAPTCHA=false
+TURNSTILE_SITEKEY=
+TURNSTILE_SECRET=
+
+AGENT_API_KEY=
+
+CORS_ALLOWED_ORIGINS=http://localhost:3000
+
+Important security warning
+
+Do not commit .env to GitHub.
+
+The .env file may contain:
+
+Django secret keys
+
+Cloudflare Turnstile secrets
+
+API keys
+
+Email credentials
+
+If a secret has already been committed to a public repository, treat it as compromised and replace/rotate it.
+
+For production:
+
+Set DJANGO_DEBUG=false
+
+Generate a new DJANGO_SECRET_KEY
+
+Set a specific ALLOWED_HOSTS value
+
+Restrict CORS_ALLOWED_ORIGINS to the real frontend
+
+Configure CSRF_TRUSTED_ORIGINS appropriately
+
+Use a production database such as PostgreSQL
+
+Configure real email credentials
+
+Enable Turnstile with a production secret
+
+Database
+
+The default database is SQLite:
+
+db.sqlite3
+
+The application can also use another database through DATABASE_URL.
+
+For example:
+
+DATABASE_URL=postgresql://USER:PASSWORD@HOST:5432/DATABASE
+
+After installing dependencies, run:
+
+python manage.py migrate
+
+Create an administrator account with:
+
+python manage.py createsuperuser
+
+Then start Django:
+
+python manage.py runserver
+
+The local backend is normally available at:
+
+http://127.0.0.1:8000/
+
+The Django Admin is available at:
+
+http://127.0.0.1:8000/admin/
+
+API Endpoints
+
+Check backend status
+
+GET /api/status/
+
+Returns information about the backend, CAPTCHA configuration and booking count.
+
+Get services and recurring time slots
+
+GET /api/services/
+
+Example response:
+
+{
+  "services": {
+    "swedish": {
+      "name": "Swedish Massage",
+      "duration": "60 min",
+      "price": 120.0
+    }
+  },
+  "time_slots": ["09:00", "10:00", "11:00"]
+}
+
+Check availability for a date
+
+GET /api/availability/?date=2026-08-25
+
+Also available as:
+
+GET /api/available-times/?date=2026-08-25
+
+Create a booking
+
+POST /api/book/
+
+The booking request can contain:
+
+{
+  "fullName": "Jane Doe",
+  "email": "jane@example.com",
+  "phone": "91234567",
+  "service": "swedish",
+  "date": "2026-08-25",
+  "time": "14:00",
+  "therapist": "No preference",
+  "notes": "First visit",
+  "consent": true,
+  "cf-turnstile-response": "TURNSTILE_TOKEN"
+}
+
+If the requested slot is available, the booking is created as CONFIRMED.
+
+If the slot already has a confirmed booking, the new booking is created as WAITLISTED.
+
+Submit a Contact Us message
+
+POST /api/contact/
+
+Example:
+
+{
+  "name": "Jane Doe",
+  "email": "jane@example.com",
+  "message": "I cannot make my appointment. Could I change it to 25 August at 2pm?"
+}
+
+The message is stored as a ContactMessage and passed through the contact-message processing workflow.
+
+Booking Statuses
+
+Bookings can have the following statuses:
+
+Status
+
+Meaning
+
+PENDING
+
+Booking is awaiting processing
+
+CONFIRMED
+
+Appointment is confirmed
+
+COMPLETED
+
+Appointment has been completed
+
+CANCELLED
+
+Appointment has been cancelled
+
+NO_SHOW
+
+Customer did not attend
+
+WAITLISTED
+
+Requested slot was full
+
+Contact Message Statuses
+
+Status
+
+Meaning
+
+PENDING
+
+Message has been received
+
+PROCESSING
+
+Agent is processing the request
+
+PROCESSED
+
+Request has been handled
+
+WAITING_FOR_CUSTOMER
+
+More information is required
+
+FAILED
+
+The requested action could not be completed
+
+Rescheduling Workflow
+
+The Contact Us system is designed to handle messages such as:
+
+"Hi, I won't be able to make my appointment. Could I change my booking date?"
+
+The workflow is:
+
+Customer submits Contact Us form
+              ↓
+ContactMessage is created
+              ↓
+Agent classifies the message
+              ↓
+Is it a reschedule request?
+        ┌─────┴─────┐
+       No           Yes
+       ↓             ↓
+General reply   Extract new date/time
+                      ↓
+             Match name + email
+                      ↓
+              Find existing booking
+                      ↓
+             Check requested slot
+                ┌─────┴─────┐
+             Available      Full
+                 ↓            ↓
+            Reschedule     Waitlist
+                 └─────┬──────┘
+                       ↓
+                Save agent reply
+                       ↓
+                Notification email
+
+If the customer provides only a new time, the existing booking date is retained.
+
+If the customer provides only a new date, the existing booking time is retained.
+
+Django Admin
+
+Open:
+
+http://127.0.0.1:8000/admin/
+
+The admin dashboard can be used to:
+
+Manage bookings
+
+Manage services
+
+Open or close recurring time slots
+
+View Contact Us messages
+
+See booking statuses
+
+See which booking a Contact Us message affected
+
+Re-run Contact Us processing
+
+Export bookings to CSV
+
+Google ADK Agent
+
+The optional my_agent/ application provides a Gemini-powered booking agent.
+
+The agent uses the same Django ORM and database as the website. There is no separate booking database for the agent.
+
+This means:
+
+Website booking
+      ↓
+Django ORM
+      ↓
+Same database
+      ↑
+Django Admin
+      ↑
+Gemini Agent
+
+The agent can work with:
+
+Services and prices
+
+Availability
+
+New bookings
+
+Cancellations
+
+Rescheduling
+
+Waitlists
+
+Booking lists
+
+Contact Us messages
+
+Running the agent
+
+The project is designed so Django and the ADK web interface do not compete for the same default port.
+
+Run Django on port 8000:
+
+python manage.py runserver 8000
+
+Run the agent on port 8001 using the project's ADK entry point/configuration:
+
+adk web --port 8001
+
+The exact ADK command may vary with the installed Google ADK version.
+
+Async Django ORM handling
+
+The agent runs in an asynchronous environment. Django ORM operations are synchronous by default.
+
+To prevent:
+
+SynchronousOnlyOperation:
+You cannot call this from an async context
+
+the agent wraps database operations in synchronous helper functions and calls them through sync_to_async.
+
+This is important when running the agent through an async ADK web server.
+
+Email
+
+Email sending is designed to work in two modes.
+
+Development mode
+
+If EMAIL_HOST is empty, customer-facing email content is handled as a development/dummy notification and is recorded so it can be inspected through the application.
+
+Production mode
+
+Configure your SMTP provider:
+
+EMAIL_HOST=smtp.example.com
+EMAIL_PORT=587
+EMAIL_HOST_USER=your-user
+EMAIL_HOST_PASSWORD=your-password
+EMAIL_USE_TLS=true
+DEFAULT_FROM_EMAIL=no-reply@yourdomain.com
+
+No major application-code change should be required for a normal SMTP provider.
+
+Cloudflare Turnstile
+
+Turnstile is optional.
+
+For local testing:
+
+REQUIRE_CAPTCHA=false
+
+For production:
+
+REQUIRE_CAPTCHA=true
+TURNSTILE_SITEKEY=your-site-key
+TURNSTILE_SECRET=your-secret-key
+
+The secret must remain on the backend and must never be placed in frontend JavaScript.
+
+Frontend Integration
+
+The public frontend can communicate with the backend through the API endpoints.
+
+A typical flow is:
+
+Luxury Spa Website
+       ↓
+POST /api/book/
+       ↓
+Django validation
+       ↓
+Turnstile verification
+       ↓
+Availability check
+       ↓
+Create CONFIRMED or WAITLISTED booking
+       ↓
+JSON response
+
+The backend also exposes:
+
+/widget.js
+
+for the project's public booking-widget integration.
+
+Production Checklist
+
+Before deploying publicly:
+
+Replace the development Django secret key
+
+Set DJANGO_DEBUG=false
+
+Restrict allowed hosts
+
+Restrict CORS origins
+
+Configure CSRF trusted origins
+
+Rotate any previously exposed API/CAPTCHA secrets
+
+Keep .env out of Git
+
+Configure a production database
+
+Configure real email delivery
+
+Configure Cloudflare Turnstile
+
+Use HTTPS
+
+Create a secure Django admin account
+
+Back up the database
+
+Test booking, cancellation and rescheduling workflows
+
+Test waitlist promotion
+
+Test the Contact Us workflow
+
+Test the frontend against the production API URL
+
+Common Problems
+
+SynchronousOnlyOperation
+
+This usually means synchronous Django ORM code is being called directly from an async context.
+
+The agent should use the existing sync_to_async wrappers instead of calling Django ORM queries directly from an async function.
+
+Port 8000 is already in use
+
+Django and ADK can both default to port 8000.
+
+Use:
+
+python manage.py runserver 8000
+
+and run ADK on another port, such as:
+
+adk web --port 8001
+
+Booking says it succeeded but does not appear in Admin
+
+Check:
+
+The backend is connected to the expected database.
+
+The request returned a successful API response.
+
+The Django migration has been applied.
+
+You are opening the Admin from the same Django instance/database.
+
+The current Django implementation saves bookings through the ORM and returns an error when saving fails.
+
+Turnstile verification fails
+
+Check:
+
+REQUIRE_CAPTCHA
+
+TURNSTILE_SITEKEY
+
+TURNSTILE_SECRET
+
+The frontend is sending cf-turnstile-response
+
+The Turnstile site key matches the website/domain
+
+The secret has not expired or been rotated
+
+Development Notes
+
+The project uses:
+
+Django ORM
+
+Django Admin
+
+SQLite by default
+
+PostgreSQL support through DATABASE_URL
+
+WhiteNoise for static files
+
+Gunicorn for production WSGI serving
+
+Cloudflare Turnstile
+
+Google Gemini / Google ADK for the optional agent
+
+Asia/Singapore as the default timezone
+
+The backend is intended to be the single source of truth for bookings. The website, Django Admin and agent should all operate on the same database rather than maintaining separate copies of booking data.
+
+License
+
+This project is currently a private/custom Luxury Spa backend project. Add an appropriate license here if the repository will be distributed publicly.
